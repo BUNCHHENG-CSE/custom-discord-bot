@@ -1,0 +1,13 @@
+.env
+.git
+.gitignore
+.idea
+.venv
+__pycache__
+**/__pycache__
+*.py[cod]
+*.log
+.bot-instance.lock
+lavalink/logs
+lavalink-build
+toolchain

@@ -1,0 +1,106 @@
+# ==============================================================================
+# .gitignore for DiscordBot
+# ==============================================================================
+
+# --- Python Bytecode & Cache ---
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.pyd
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# --- Testing, Coverage & Linters ---
+.cache
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+nosetests.xml
+coverage.xml
+*.cover
+
+# --- Virtual Environments ---
+.venv/
+venv/
+env/
+ENV/
+env.bak/
+venv.bak/
+
+# --- Environment Variables & Secrets ---
+# Never commit real credentials or secrets
+.env
+.env.*
+!.env.example
+
+# --- IDEs & Code Editors ---
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+*.sublime-workspace
+*.sublime-project
+
+# --- Logs & Runtime Artifacts ---
+*.log
+logs/
+lavalink/logs/
+bot_stderr.log
+bot_stdout.log
+.bot-instance.lock
+*.pid
+
+# --- Build Artifacts & Toolchains (Heavy Directories) ---
+lavalink-build/
+toolchain/
+
+# --- Large Binaries & JARs (Optional) ---
+# Lavalink.jar is ~95MB (exceeds GitHub's 50MB recommended limit and close to 100MB block limit)
+# Uncomment the lines below if you prefer downloading Lavalink.jar via script or release:
+# lavalink/Lavalink.jar
+# lavalink/plugins/*.jar
+
+# --- Sensitive Configs ---
+# lavalink/application.yml contains a real YouTube OAuth refresh token.
+# Track an application.example.yml instead:
+lavalink/application.yml
+!lavalink/application.example.yml
+
+# --- Local Databases ---
+*.sqlite
+*.sqlite3
+*.db
+
+# --- OS Generated Files ---
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+ehthumbs_vista.db
+Thumbs.db
+Thumbs.db:encryptable
+desktop.ini
+$RECYCLE.BIN/

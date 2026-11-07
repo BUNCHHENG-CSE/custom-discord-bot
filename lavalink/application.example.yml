@@ -1,0 +1,90 @@
+server:
+  port: 2333
+  address: 0.0.0.0
+
+plugins:
+  youtube:
+    enabled: true
+    oauth:
+      enabled: true
+      refreshToken: "${YOUTUBE_OAUTH_REFRESH_TOKEN:}" # or paste your YouTube OAuth refresh token here
+    # OAuth-compatible clients first (MUSIC/TVHTML5_SIMPLY_EMBEDDED/IOS work
+    # with the refresh token); WEBEMBEDDED/MWEB often get blocked ("Did not
+    # detect any supported formats") from datacenter IPs.
+    clients:
+      - MUSIC
+      - ANDROID_VR
+      - IOS
+      - WEB
+      - WEBEMBEDDED
+
+lavalink:
+  # No `plugins.dependency` entries: the youtube-source snapshot jar is placed
+  # directly in the plugins/ folder (youtube-plugin.jar, commit 2be8e542 which
+  # fixes the "no actions match" / "Did not detect any supported formats"
+  # signature-cipher error). Lavalink auto-loads everything in plugins/.
+  plugins: []
+  server:
+    password: "${LAVALINK_PASSWORD:youshallnotpass}"
+    sources:
+      # MUST be false when using the youtube-source plugin. Leaving it true makes
+      # Lavalink register its deprecated built-in YoutubeAudioSourceManager,
+      # whose signature cipher is broken ("Must find action functions from
+      # script") — that overrides the plugin and breaks every YouTube link.
+      youtube: false
+      bandcamp: true
+      soundcloud: true
+      twitch: true
+      vimeo: true
+      http: true
+      local: false
+    filters:
+      volume: true
+      equalizer: true
+      karaoke: true
+      timescale: true
+      tremolo: true
+      vibrato: true
+      distortion: true
+      rotation: true
+      channelMix: true
+      lowPass: true
+    bufferDurationMs: 400
+    frameBufferDurationMs: 5000
+    opusEncodingQuality: 10
+    resamplingQuality: HIGH
+    trackStuckThresholdMs: 10000
+    useSeekGhosting: true
+    youtubePlaylistLoadLimit: 6
+    playerUpdateInterval: 5
+    youtubeSearchEnabled: true
+    soundcloudSearchEnabled: true
+
+metrics:
+  prometheus:
+    enabled: false
+    endpoint: /metrics
+
+logging:
+  file:
+    path: ./logs/
+  level:
+    root: INFO
+    lavalink: INFO
+    # TRACE/DEBUG for these packages records Discord voice tokens, YouTube
+    # access tokens and signed media URLs. Enable it only for short diagnostics.
+    lavalink.server.io.SocketContext: INFO
+    com.sedmelluq.discord.lavaplayer.tools.ExceptionTools: INFO
+    dev.lavalink.youtube: INFO
+    moe.kyokobot.koe.internal.dave: INFO
+    moe.kyokobot.koe.internal.gateway: INFO
+  request:
+    enabled: true
+    includeClientInfo: true
+    includeHeaders: false
+    includeQueryString: true
+    includePayload: false
+  logback:
+    rollingpolicy:
+      max-file-size: 1GB
+      max-history: 30

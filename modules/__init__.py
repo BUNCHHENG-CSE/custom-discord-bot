@@ -1,0 +1,15 @@
+from . import (
+    moderation,
+    tickets,
+    giveaways,
+    music,
+    ai,
+    alerts,
+    utility,
+    welcome,
+    roles,
+    tags,
+    games,
+    community,
+    vpn,
+)
