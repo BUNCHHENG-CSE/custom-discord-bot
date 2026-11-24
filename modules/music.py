@@ -1,4 +1,4 @@
-from interactions import slash, subcommand, Interaction, STR, CHANNEL, INT
+from interactions import subcommand, Interaction, STR, CHANNEL, INT
 from lavalink import lavalink
 import state
 import asyncio
@@ -173,18 +173,12 @@ async def join(i: Interaction, channel=None):
             ephemeral=True,
         )
 
-    # Tell Discord to move the bot into that channel via Gateway opcode 4.
-    # Leave first, then rejoin, so Discord always issues a fresh voice
-    # session/token — re-sending op-4 to a channel the bot is already in is a
-    # no-op and never triggers a new VOICE_SERVER_UPDATE.
-    state.bot_voice_sessions.pop(gid, None)
-    state.pending_voice.pop(gid, None)
-    await state.gateway.send_voice_state(gid, None)
-    await asyncio.sleep(0.5)
-    await state.gateway.send_voice_state(gid, target)
-    await i.followup(f"🔊 Joining <#{target}>…")
-    # Note: the actual connection finishes when Discord sends us
-    # VOICE_STATE_UPDATE + VOICE_SERVER_UPDATE, which main.py forwards to Lavalink.
+    # Clean leave+rejoin via _ensure_voice so Discord issues a fresh voice
+    # session/token and WebSocketClosedEvent from a previous session cannot
+    # tear down the new player.
+    if not await _ensure_voice(gid, target):
+        return await i.followup("❌ Voice join failed.", ephemeral=True)
+    await i.followup(f"🔊 Joined <#{target}>.")
 
 
 @subcommand("music", "Music commands", "leave", "Disconnect from voice")
@@ -203,8 +197,8 @@ async def play(i: Interaction, query):
     await i.defer()
     gid = int(i.guild_id)
 
-    # Auto-join voice (keep your existing code)
-    if gid not in lavalink.players:
+    # Auto-join voice (or re-join if the bot was manually disconnected)
+    if gid not in lavalink.players or gid not in state.bot_voice_sessions:
         user_vc = state.voice_states.get(gid, {}).get(int(i.user_id))
         if not user_vc:
             return await i.followup("❌ Join a voice channel first.", ephemeral=True)
@@ -264,7 +258,11 @@ async def play(i: Interaction, query):
 
     if is_playlist:
         # Playlist embed (like Jockie)
-        total_secs = sum((t.get("info", {}).get("length") or 0) for t in tracks) // 1000
+        total_secs = sum(
+            (t.get("info", {}).get("length") or 0)
+            for t in tracks
+            if not (t.get("info") or {}).get("isStream")
+        ) // 1000
         mins, secs = divmod(total_secs, 60)
         hours, mins = divmod(mins, 60)
         if hours:
@@ -281,13 +279,9 @@ async def play(i: Interaction, query):
                 {"name": "Tracks", "value": str(len(tracks)), "inline": True},
             ],
         }
-        # Queue all tracks, start the first
-        first_started = False
+        # Queue all tracks atomically and start the first
         try:
-            for t in tracks:
-                started = await lavalink.play(gid, t)
-                if started:
-                    first_started = True
+            await lavalink.play_tracks(gid, tracks)
         except Exception as e:
             return await i.followup(f"❌ Failed to start playback: `{e}`", ephemeral=True)
         await i.followup(embeds=[embed])
@@ -366,11 +360,16 @@ async def nowplaying(i: Interaction):
     if not p.current:
         return await i.followup("Nothing playing.", ephemeral=True)
     info = p.current.get("info", {})
-    length = _format_ms(info.get("length") or 0)
+    if info.get("isStream"):
+        dur_str = "`🔴 LIVE`"
+    else:
+        length = _format_ms(info.get("length") or 0)
+        pos = _format_ms(p.estimated_position())
+        dur_str = f"`{pos} / {length}`"
     embed = {
         "title": f"🎵 {info.get('title', 'Unknown')}",
         "url": info.get("uri"),
-        "description": f"**Artist:** {info.get('author', 'Unknown')}\n**Duration:** `{length}`",
+        "description": f"**Artist:** {info.get('author', 'Unknown')}\n**Duration:** {dur_str}",
         "color": 0x5865F2,
         "footer": {
             "text": (
@@ -455,20 +454,24 @@ async def queue_cmd(i: Interaction):
         return await i.followup("📭 The queue is completely empty.")
 
     curr_info = p.current.get("info", {}) if p.current else {}
-    curr_title = curr_info.get("title", "Unknown")
-    curr_url = curr_info.get("uri")
-    curr_len = _format_ms(curr_info.get("length") or 0)
-    curr_display = f"[{curr_title}]({curr_url}) (`{curr_len}`)" if curr_url else f"`{curr_title}` (`{curr_len}`)"
+    if p.current:
+        curr_title = curr_info.get("title", "Unknown")
+        curr_url = curr_info.get("uri")
+        curr_len = "🔴 LIVE" if curr_info.get("isStream") else _format_ms(curr_info.get("length") or 0)
+        curr_display = f"[{curr_title}]({curr_url}) (`{curr_len}`)" if curr_url else f"`{curr_title}` (`{curr_len}`)"
+    else:
+        curr_display = "*Nothing currently playing*"
 
     lines = []
-    total_ms = (curr_info.get("length") or 0)
+    total_ms = 0 if curr_info.get("isStream") else (curr_info.get("length") or 0)
     for idx, t in enumerate(p.queue[:10], start=1):
         info = t.get("info", {})
-        length = info.get("length") or 0
+        is_stream = bool(info.get("isStream"))
+        length = 0 if is_stream else (info.get("length") or 0)
         total_ms += length
         title = info.get("title", "Unknown")
         uri = info.get("uri")
-        t_str = _format_ms(length)
+        t_str = "🔴 LIVE" if is_stream else _format_ms(length)
         link = f"[{title[:55]}]({uri})" if uri else title[:55]
         lines.append(f"`{idx}.` {link} — `{t_str}`")
 
@@ -634,6 +637,7 @@ async def mode247_cmd(i: Interaction, mode: str | None = None):
         from database import db
         await db.ensure_guild(gid)
         await db.pool.execute("UPDATE guilds SET music_247=$1 WHERE id=$2", enabled, gid)
+        db.invalidate_guild(gid)
     except Exception:
         pass
     await i.followup(f"🌙 24/7 mode is now **{'ENABLED' if enabled else 'DISABLED'}**.")
@@ -674,5 +678,3 @@ async def handle_component(i: Interaction):
         await lavalink.destroy(gid)
         await state.gateway.send_voice_state(gid, None)
         await i.respond(f"⏹️ **Stopped and disconnected** by <@{i.user_id}>.")
-
-

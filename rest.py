@@ -1,4 +1,17 @@
-import asyncio, time, aiohttp
+import asyncio, re, time, aiohttp
+
+# Discord rate-limits per route, keyed by its "major parameter" (channel/guild/webhook id).
+# Collapse other snowflakes so e.g. every message id in a channel shares one bucket.
+_MAJOR_RE = re.compile(r"^/(channels|guilds|webhooks)/(\d+)")
+_ID_RE = re.compile(r"/\d{15,21}")
+
+def _route_key(method: str, path: str) -> str:
+    path = path.split("?", 1)[0]
+    m = _MAJOR_RE.match(path)
+    if m:
+        rest = _ID_RE.sub("/:id", path[m.end():])
+        return f"{method}:/{m.group(1)}/{m.group(2)}{rest}"
+    return f"{method}:{_ID_RE.sub('/:id', path)}"
 
 API = "https://discord.com/api/v10"
 
@@ -15,10 +28,9 @@ class REST:
         self.session: aiohttp.ClientSession | None = None
         self._buckets: dict[str, _Bucket] = {}
         self._global_reset = 0.0
-        self._global_lock = asyncio.Lock()
 
     async def start(self):
-        self.session = aiohttp.ClientSession(headers={
+        self.session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30), headers={
             "Authorization": f"Bot {self.token}",
             "User-Agent": "RawBot/1.0",
         })
@@ -28,16 +40,16 @@ class REST:
 
     async def request(self, method: str, path: str, *, json=None, data=None, params=None, reason=None):
         url = path if path.startswith("http") else API + path
-        bucket = self._buckets.setdefault(f"{method}:{path.split('/')[3] if len(path.split('/'))>3 else path}",
-                                           _Bucket())
+        bucket = self._buckets.get(key := _route_key(method, path))
+        if bucket is None:
+            bucket = self._buckets[key] = _Bucket()
         headers = {}
         if reason: headers["X-Audit-Log-Reason"] = reason[:512]
 
         for attempt in range(5):
-            async with self._global_lock:
-                now = time.time()
-                if now < self._global_reset:
-                    await asyncio.sleep(self._global_reset - now)
+            now = time.time()
+            if now < self._global_reset:
+                await asyncio.sleep(self._global_reset - now)
             async with bucket.lock:
                 now = time.time()
                 if bucket.remaining <= 0 and now < bucket.reset_at:
@@ -50,15 +62,18 @@ class REST:
                 if ra is not None:  bucket.reset_at = time.time() + float(ra)
 
                 if resp.status == 429:
-                    data = await resp.json()
-                    wait = float(data.get("retry_after", 1.0))
-                    if data.get("global"): self._global_reset = time.time() + wait
+                    try:
+                        body = await resp.json(content_type=None)
+                    except Exception:
+                        body = {}
+                    wait = float(body.get("retry_after") or resp.headers.get("Retry-After") or 1.0)
+                    if body.get("global"): self._global_reset = time.time() + wait
                     await asyncio.sleep(wait)
                     continue
                 if resp.status >= 500:
                     await asyncio.sleep(1 + attempt)
                     continue
-                if resp.status == 204:
+                if resp.status == 204 or resp.content_length == 0:
                     return None
                 if resp.status >= 400:
                     body = await resp.text()

@@ -8,15 +8,19 @@ plugins:
     oauth:
       enabled: true
       refreshToken: "${YOUTUBE_OAUTH_REFRESH_TOKEN:}" # or paste your YouTube OAuth refresh token here
-    # OAuth-compatible clients first (MUSIC/TVHTML5_SIMPLY_EMBEDDED/IOS work
-    # with the refresh token); WEBEMBEDDED/MWEB often get blocked ("Did not
-    # detect any supported formats") from datacenter IPs.
+    # OAuth-compatible clients first (TV is the OAuth playback client in
+    # youtube-plugin; MUSIC handles ytmsearch/playlists; TVHTML5_SIMPLY/WEB/
+    # WEBEMBEDDED/MWEB decipher player scripts so streams aren't throttled or
+    # cut off mid-song).
     clients:
       - MUSIC
-      - ANDROID_VR
-      - IOS
+      - TV
+      - TVHTML5_SIMPLY
       - WEB
       - WEBEMBEDDED
+      - MWEB
+      - ANDROID_VR
+      - IOS
 
 lavalink:
   # No `plugins.dependency` entries: the youtube-source snapshot jar is placed
@@ -53,10 +57,10 @@ lavalink:
     frameBufferDurationMs: 5000
     opusEncodingQuality: 10
     resamplingQuality: HIGH
-    trackStuckThresholdMs: 10000
+    trackStuckThresholdMs: 15000
     useSeekGhosting: true
     youtubePlaylistLoadLimit: 6
-    playerUpdateInterval: 5
+    playerUpdateInterval: 2
     youtubeSearchEnabled: true
     soundcloudSearchEnabled: true
 

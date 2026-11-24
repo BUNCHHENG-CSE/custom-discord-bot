@@ -2,7 +2,6 @@ import asyncio, time, re
 from datetime import datetime, timezone
 from interactions import slash, Interaction, USER, STR, INT
 from database import db
-from config import Config
 from helpers.permissions import can_use_staff_commands
 import state
 
@@ -20,12 +19,14 @@ async def _require_staff(i: Interaction) -> bool:
     return False
 
 def parse_duration(s: str):
-    total, num, unit = 0, "", ""
-    for c in s.lower():
+    total, num = 0, ""
+    for c in str(s).lower():
         if c.isdigit(): num += c
         elif c in _durations and num:
             total += int(num) * _durations[c]; num = ""
         elif not c.isspace(): return None
+    if num:
+        return None
     return total or None
 
 async def _log(guild_id, rest, action, target, moderator, reason, case_id, duration=None):
@@ -37,7 +38,10 @@ async def _log(guild_id, rest, action, target, moderator, reason, case_id, durat
                  {"name": "Moderator", "value": f"<@{moderator}>", "inline": True},
                  {"name": "Reason", "value": reason or "—", "inline": False},
              ]}
-    await rest.post(f"/channels/{cfg['log_channel']}/messages", json={"embeds": [embed]})
+    try:
+        await rest.post(f"/channels/{cfg['log_channel']}/messages", json={"embeds": [embed]})
+    except Exception:
+        pass
 
 @slash("ban", "Ban a member", [
     {"name": "member", "description": "Member to ban", "type": USER, "required": True},
@@ -47,12 +51,16 @@ async def _log(guild_id, rest, action, target, moderator, reason, case_id, durat
 async def ban(i: Interaction, member, reason="No reason", delete_days=0):
     if not await _require_staff(i):
         return
-    await i.rest.put(f"/guilds/{i.guild_id}/bans/{member}",
-                     params={"delete_message_days": min(max(delete_days or 0, 0), 7)},
-                     reason=reason)
-    case = await db.add_case(i.guild_id, int(member), int(i.user_id), "ban", reason)
-    await i.respond(f"✅ Banned <@{member}> — Case #{case}")
-    await _log(i.guild_id, i.rest, "ban", member, i.user_id, reason, case)
+    member_id = int(str(member).strip().strip("<@!>"))
+    try:
+        await i.rest.put(f"/guilds/{i.guild_id}/bans/{member_id}",
+                         params={"delete_message_days": min(max(delete_days or 0, 0), 7)},
+                         reason=reason)
+    except Exception as e:
+        return await i.respond(f"❌ Failed to ban <@{member_id}>: `{e}`", ephemeral=True)
+    case = await db.add_case(i.guild_id, member_id, int(i.user_id), "ban", reason)
+    await i.respond(f"✅ Banned <@{member_id}> — Case #{case}")
+    await _log(i.guild_id, i.rest, "ban", member_id, i.user_id, reason, case)
 
 @slash("kick", "Kick a member", [
     {"name": "member", "description": "Member to kick", "type": USER, "required": True},
@@ -61,10 +69,14 @@ async def ban(i: Interaction, member, reason="No reason", delete_days=0):
 async def kick(i: Interaction, member, reason="No reason"):
     if not await _require_staff(i):
         return
-    await i.rest.delete(f"/guilds/{i.guild_id}/members/{member}", reason=reason)
-    case = await db.add_case(i.guild_id, int(member), int(i.user_id), "kick", reason)
-    await i.respond(f"✅ Kicked <@{member}> — Case #{case}")
-    await _log(i.guild_id, i.rest, "kick", member, i.user_id, reason, case)
+    member_id = int(str(member).strip().strip("<@!>"))
+    try:
+        await i.rest.delete(f"/guilds/{i.guild_id}/members/{member_id}", reason=reason)
+    except Exception as e:
+        return await i.respond(f"❌ Failed to kick <@{member_id}>: `{e}`", ephemeral=True)
+    case = await db.add_case(i.guild_id, member_id, int(i.user_id), "kick", reason)
+    await i.respond(f"✅ Kicked <@{member_id}> — Case #{case}")
+    await _log(i.guild_id, i.rest, "kick", member_id, i.user_id, reason, case)
 
 @slash("timeout", "Timeout a member", [
     {"name": "member", "description": "Member", "type": USER, "required": True},
@@ -74,17 +86,21 @@ async def kick(i: Interaction, member, reason="No reason"):
 async def timeout(i: Interaction, member, duration, reason="No reason"):
     if not await _require_staff(i):
         return
+    member_id = int(str(member).strip().strip("<@!>"))
     secs = parse_duration(duration)
     if not secs or secs > 28*86400:
         return await i.respond("❌ Duration must be ≤ 28 days (e.g. `10m`, `1h`).", ephemeral=True)
     until = datetime.now(timezone.utc).timestamp() + secs
     iso = datetime.fromtimestamp(until, tz=timezone.utc).isoformat()
-    await i.rest.patch(f"/guilds/{i.guild_id}/members/{member}",
-                       json={"communication_disabled_until": iso}, reason=reason)
-    case = await db.add_case(i.guild_id, int(member), int(i.user_id), "timeout", reason,
+    try:
+        await i.rest.patch(f"/guilds/{i.guild_id}/members/{member_id}",
+                           json={"communication_disabled_until": iso}, reason=reason)
+    except Exception as e:
+        return await i.respond(f"❌ Failed to timeout <@{member_id}>: `{e}`", ephemeral=True)
+    case = await db.add_case(i.guild_id, member_id, int(i.user_id), "timeout", reason,
                               duration=secs, expires_at=datetime.fromtimestamp(until, tz=timezone.utc))
-    await i.respond(f"✅ Timed out <@{member}> for {duration} — Case #{case}")
-    await _log(i.guild_id, i.rest, "timeout", member, i.user_id, reason, case, secs)
+    await i.respond(f"✅ Timed out <@{member_id}> for {duration} — Case #{case}")
+    await _log(i.guild_id, i.rest, "timeout", member_id, i.user_id, reason, case, secs)
 
 @slash("unban", "Unban a user by ID", [
     {"name": "user_id", "description": "ID of user to unban", "type": STR, "required": True},
@@ -161,13 +177,16 @@ async def warnings(i: Interaction, member):
 async def purge(i: Interaction, amount):
     if not await _require_staff(i):
         return
-    amount = min(max(amount, 1), 100)
-    msgs = await i.rest.get(f"/channels/{i.channel_id}/messages", params={"limit": amount})
-    ids = [m["id"] for m in msgs if (time.time() - _snowflake_ts(m["id"])) < 14*86400]
-    if len(ids) == 1:
-        await i.rest.delete(f"/channels/{i.channel_id}/messages/{ids[0]}")
-    elif len(ids) > 1:
-        await i.rest.post(f"/channels/{i.channel_id}/messages/bulk-delete", json={"messages": ids})
+    amount = min(max(int(amount), 1), 100)
+    try:
+        msgs = await i.rest.get(f"/channels/{i.channel_id}/messages", params={"limit": amount})
+        ids = [m["id"] for m in msgs if (time.time() - _snowflake_ts(m["id"])) < 14*86400]
+        if len(ids) == 1:
+            await i.rest.delete(f"/channels/{i.channel_id}/messages/{ids[0]}")
+        elif len(ids) > 1:
+            await i.rest.post(f"/channels/{i.channel_id}/messages/bulk-delete", json={"messages": ids})
+    except Exception as e:
+        return await i.respond(f"❌ Failed to purge messages: `{e}`", ephemeral=True)
     await i.respond(f"🧹 Deleted {len(ids)} messages.", ephemeral=True)
 
 
@@ -297,6 +316,13 @@ def _snowflake_ts(sid):
 _spam_cache: dict[tuple[int,int], list[float]] = {}
 _INVITE_RE = re.compile(r"(?:https?://)?(?:www\.)?(?:discord\.(?:gg|io|me|li)|discord(?:app)?\.com/invite)/[a-zA-Z0-9]+", re.IGNORECASE)
 _MENTION_RE = re.compile(r"<@!?\d+>|<@&\d+>")
+
+
+def automod_would_trigger(content: str) -> bool:
+    """Cheap pre-check so the per-message staff lookup only runs when needed."""
+    return bool(content) and (
+        _INVITE_RE.search(content) is not None or len(_MENTION_RE.findall(content)) >= 5
+    )
 
 async def automod_message(i_guild, i_channel, author_id, rest, content="", message_id=None, is_staff_user=False):
     if is_staff_user:

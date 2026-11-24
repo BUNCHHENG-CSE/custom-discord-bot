@@ -3,7 +3,7 @@
 from urllib.parse import quote
 
 from database import db
-from helpers.permissions import can_manage_bot
+from helpers.permissions import can_manage_bot_async
 from interactions import Interaction, MessageContext, ROLE, STR, slash
 
 
@@ -55,7 +55,7 @@ async def _find_message_channel(i: Interaction, message_id: int) -> int | None:
     {"name": "role", "description": "Role to assign, or off", "type": STR, "required": True},
 ])
 async def autorole(i: Interaction, value):
-    if not can_manage_bot(i):
+    if not await can_manage_bot_async(i, db.pool):
         return await i.respond("❌ Only the server owner or an administrator can configure autoroles.", ephemeral=True)
 
     if value.lower() in {"off", "disable", "clear"}:
@@ -90,7 +90,7 @@ async def autorole(i: Interaction, value):
     {"name": "role", "description": "Role to assign", "type": ROLE, "required": True},
 ])
 async def reactionrole(i: Interaction, message_id, emoji, role):
-    if not can_manage_bot(i):
+    if not await can_manage_bot_async(i, db.pool):
         return await i.respond("❌ Only the server owner or an administrator can configure reaction roles.", ephemeral=True)
     if not _require_mentioned_role(i, role):
         return await i.respond("❌ Mention a role. Usage: `tct!reactionrole <message_id> <emoji> @Role`")
@@ -144,7 +144,7 @@ async def reactionrole(i: Interaction, message_id, emoji, role):
     {"name": "emoji", "description": "Unicode or custom emoji", "type": STR, "required": True},
 ])
 async def remove_reactionrole(i: Interaction, message_id, emoji):
-    if not can_manage_bot(i):
+    if not await can_manage_bot_async(i, db.pool):
         return await i.respond("❌ Only the server owner or an administrator can configure reaction roles.", ephemeral=True)
     emoji_key = _command_emoji(emoji)
     deleted = await db.pool.fetchrow(
@@ -165,7 +165,7 @@ async def remove_reactionrole(i: Interaction, message_id, emoji):
 
 @slash("reactionroles", "List reaction roles configured in this server")
 async def list_reactionroles(i: Interaction):
-    if not can_manage_bot(i):
+    if not await can_manage_bot_async(i, db.pool):
         return await i.respond("❌ Only the server owner or an administrator can view this configuration.", ephemeral=True)
     rows = await db.pool.fetch(
         "SELECT channel_id, message_id, emoji, role_id FROM reaction_roles "

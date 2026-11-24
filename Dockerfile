@@ -11,6 +11,7 @@ RUN pip install --no-cache-dir --upgrade pip \
 
 COPY config.py database.py gateway.py interactions.py lavalink.py main.py ./
 COPY prefix_commands.py rest.py state.py schema.sql ./
+COPY helpers/ ./helpers/
 COPY modules/ ./modules/
 
 RUN useradd --create-home --uid 10001 bot \

@@ -4,7 +4,7 @@ import sys
 from dataclasses import dataclass
 from interactions import slash, Interaction, MessageContext, CHANNEL, ROLE, USER, STR
 from database import db
-from helpers.permissions import can_manage_bot, can_manage_bot_async, can_use_staff_commands
+from helpers.permissions import can_manage_bot_async, can_use_staff_commands
 import state
 from lavalink import lavalink
 
@@ -221,6 +221,7 @@ async def set_disabled_commands(guild_id: int, disabled: set[str]) -> set[str]:
                 json.dumps(sorted(clean)),
                 gid,
             )
+            db.invalidate_guild(gid)
         except Exception:
             pass
     return clean
@@ -569,10 +570,11 @@ async def ping(i: Interaction):
     {"name": "channel", "description": "Channel", "type": CHANNEL, "required": True},
 ])
 async def setlog(i: Interaction, channel):
-    if not can_manage_bot(i):
+    if not await can_manage_bot_async(i, db.pool):
         return await i.respond("❌ Only the server owner or an administrator can configure the bot.", ephemeral=True)
     await db.ensure_guild(i.guild_id)
-    await db.pool.execute("UPDATE guilds SET log_channel=$1 WHERE id=$2", int(channel), i.guild_id)
+    await db.pool.execute("UPDATE guilds SET log_channel=$1 WHERE id=$2", int(channel), int(i.guild_id))
+    db.invalidate_guild(i.guild_id)
     await i.respond(f"✅ Log channel set to <#{channel}>", ephemeral=True)
 
 
@@ -582,7 +584,7 @@ async def setlog(i: Interaction, channel):
 ])
 async def setmodrole(i: Interaction, role, role_type="mod"):
     """Handle tct!setmodrole and upsert the mentioned role for this guild."""
-    if not can_manage_bot(i):
+    if not await can_manage_bot_async(i, db.pool):
         return await i.respond(
             "❌ Only the server owner or an administrator can configure staff roles.",
             ephemeral=True,
@@ -599,7 +601,7 @@ async def setmodrole(i: Interaction, role, role_type="mod"):
     role_name = role_obj.get("name") if role_obj else ""
 
     raw_type = str(role_type or "").lower().strip()
-    from helpers.permissions import add_cached_admin_role, remove_cached_admin_role, is_admin_role_name
+    from helpers.permissions import add_cached_admin_role, add_cached_staff_role, remove_cached_admin_role, is_admin_role_name
 
     if "admin" in raw_type or ("mod" not in raw_type and is_admin_role_name(role_name)):
         actual_type = "admin"
@@ -622,6 +624,7 @@ async def setmodrole(i: Interaction, role, role_type="mod"):
         await i.respond(f"👑 <@&{role}> is now configured as an **Administrator** role (full bot access).")
     else:
         remove_cached_admin_role(int(i.guild_id), int(role))
+        add_cached_staff_role(int(i.guild_id), int(role))
         await i.respond(f"🛡️ <@&{role}> can now use **Staff / Moderator** commands.")
 
 
@@ -636,7 +639,7 @@ async def setadminrole(i: Interaction, role):
     {"name": "role", "description": "Role to remove", "type": ROLE, "required": True},
 ])
 async def removemodrole(i: Interaction, role):
-    if not can_manage_bot(i):
+    if not await can_manage_bot_async(i, db.pool):
         return await i.respond(
             "❌ Only the server owner or an administrator can configure staff roles.",
             ephemeral=True,
@@ -649,8 +652,8 @@ async def removemodrole(i: Interaction, role):
         "DELETE FROM guild_staff_roles WHERE guild_id = $1 AND role_id = $2",
         int(i.guild_id), int(role),
     )
-    from helpers.permissions import remove_cached_admin_role
-    remove_cached_admin_role(int(i.guild_id), int(role))
+    from helpers.permissions import remove_cached_staff_role
+    remove_cached_staff_role(int(i.guild_id), int(role))
 
     if result == "DELETE 0":
         return await i.respond(f"ℹ️ <@&{role}> was not a configured staff role.")
@@ -659,7 +662,7 @@ async def removemodrole(i: Interaction, role):
 
 @slash("modroles", "List configured bot staff and administrator roles")
 async def modroles(i: Interaction):
-    if not can_manage_bot(i):
+    if not await can_manage_bot_async(i, db.pool):
         return await i.respond(
             "❌ Only the server owner or an administrator can view this configuration.",
             ephemeral=True,
@@ -808,7 +811,7 @@ async def botstats(i: Interaction):
             {"name": "👥 Cached Members", "value": f"`{cached_members}`", "inline": True},
             {"name": "🎵 Voice Players", "value": f"`{active_players}` active", "inline": True},
             {"name": "🐍 Python Version", "value": f"`{sys.version.split()[0]}`", "inline": True},
-            {"name": "🗄️ Database", "value": "PostgreSQL & Redis connected", "inline": True},
+            {"name": "🗄️ Database", "value": "PostgreSQL + Redis" if db.redis else "PostgreSQL (In-Memory Cache)", "inline": True},
         ],
     }
     await i.respond(embeds=[embed])

@@ -1,10 +1,9 @@
-import shlex
 from dataclasses import dataclass
 
 from interactions import MessageContext, resolve_handler
 from modules.welcome import configure_greeting
 from database import db
-from helpers.permissions import can_manage_bot, can_manage_bot_async, can_use_staff_commands
+from helpers.permissions import can_manage_bot_async, can_use_staff_commands
 
 
 PREFIX = "tct!"
@@ -138,9 +137,11 @@ COMMANDS = {
                                   ("message_id", "emoji"), access="admin"),
     "reactionroles": Command("reactionroles", "tct!reactionroles", access="admin"),
     "welcome": Command("welcome", "tct!welcome [test|message|title|color|footer|thumbnail|fields|ping|image|off|reset]", access="admin"),
+    "welcomedesign": Command("welcome", "tct!welcomedesign [test|message|title|color|footer|thumbnail|fields|ping|image|off|reset]", access="admin"),
     "setwelcome": Command("setwelcome", "tct!setwelcome #channel", ("channel",), access="admin"),
     "welcomechannel": Command("setwelcome", "tct!welcomechannel #channel", ("channel",), access="admin"),
     "goodbye": Command("goodbye", "tct!goodbye [test|message|title|color|footer|thumbnail|fields|ping|image|off|reset]", access="admin"),
+    "goodbyedesign": Command("goodbye", "tct!goodbyedesign [test|message|title|color|footer|thumbnail|fields|ping|image|off|reset]", access="admin"),
     "setgoodbye": Command("setgoodbye", "tct!setgoodbye #channel", ("channel",), access="admin"),
     "goodbyechannel": Command("setgoodbye", "tct!goodbyechannel #channel", ("channel",), access="admin"),
     "vpnregions": Command("vpn:regions", "tct!vpnregions"),
@@ -162,25 +163,30 @@ def _snowflake(value: str) -> str:
 
 
 def _arguments(command: Command, text: str) -> dict:
-    try:
-        tokens = shlex.split(text)
-    except ValueError as exc:
-        raise ValueError(f"Invalid quotes: {exc}") from exc
-
+    raw = text.strip()
     required = len(command.fields)
-    if len(tokens) < required:
-        raise ValueError(f"Usage: `{command.usage}`")
-    if not command.rest_field and len(tokens) > required:
-        raise ValueError(f"Too many arguments. Usage: `{command.usage}`")
 
-    result = {name: tokens[index] for index, name in enumerate(command.fields)}
     if command.rest_field:
-        remainder = " ".join(tokens[required:]).strip()
-        optional_rest = {"reason", "panel", "channel", "member", "nickname", "mode", "dice", "threshold", "role_type", "name", "category", "device"}
+        tokens = raw.split(maxsplit=required) if raw else []
+        if len(tokens) < required:
+            raise ValueError(f"Usage: `{command.usage}`")
+        result = {name: tokens[index] for index, name in enumerate(command.fields)}
+        remainder = tokens[required].strip() if len(tokens) > required else ""
+        optional_rest = {
+            "reason", "panel", "channel", "member", "nickname", "mode",
+            "dice", "threshold", "role_type", "name", "category", "device",
+        }
         if not remainder and command.rest_field not in optional_rest:
             raise ValueError(f"Usage: `{command.usage}`")
         if remainder:
             result[command.rest_field] = remainder
+    else:
+        tokens = raw.split() if raw else []
+        if len(tokens) < required:
+            raise ValueError(f"Usage: `{command.usage}`")
+        if len(tokens) > required:
+            raise ValueError(f"Too many arguments. Usage: `{command.usage}`")
+        result = {name: tokens[index] for index, name in enumerate(command.fields)}
 
     for field in ("member", "channel", "role", "message_id"):
         if field in result:

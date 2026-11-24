@@ -1,15 +1,43 @@
-import asyncpg, redis.asyncio as redis, json
+import time
+import logging
+import asyncpg
+import redis.asyncio as redis
 from config import Config
+
+log = logging.getLogger("database")
 
 class DB:
     def __init__(self):
         self.pool: asyncpg.Pool | None = None
         self.redis: redis.Redis | None = None
+        self._known_guilds: set[int] = set()
+        self._guild_cache: dict[int, tuple[float, asyncpg.Record | None]] = {}
 
     async def connect(self):
-        self.pool = await asyncpg.create_pool(Config.dsn(), min_size=2, max_size=10)
-        self.redis = redis.Redis(host=Config.REDIS_HOST, port=Config.REDIS_PORT, decode_responses=True)
-        with open("schema.sql") as f:
+        # Tuned for Wispbyte 512 MB RAM container & Neon serverless PostgreSQL
+        self.pool = await asyncpg.create_pool(
+            Config.dsn(),
+            min_size=1,
+            max_size=5,
+            command_timeout=60,
+            max_inactive_connection_lifetime=60,
+        )
+        if Config.REDIS_URL:
+            self.redis = redis.from_url(Config.REDIS_URL, decode_responses=True)
+        elif Config.REDIS_HOST and Config.REDIS_HOST.lower() not in ("none", "disabled", "false"):
+            try:
+                r = redis.Redis(
+                    host=Config.REDIS_HOST,
+                    port=Config.REDIS_PORT,
+                    decode_responses=True,
+                    socket_connect_timeout=2,
+                )
+                await r.ping()
+                self.redis = r
+            except Exception:
+                log.info("Redis unavailable at %s:%s — using in-memory fallback.", Config.REDIS_HOST, Config.REDIS_PORT)
+                self.redis = None
+        with open("schema.sql", encoding="utf-8") as f:
             await self.pool.execute(f.read())
         try:
             from helpers.permissions import sync_admin_roles
@@ -21,16 +49,32 @@ class DB:
         if self.pool: await self.pool.close()
         if self.redis: await self.redis.close()
 
+    def invalidate_guild(self, gid: int | str | None) -> None:
+        if gid is not None:
+            self._guild_cache.pop(int(gid), None)
+
     async def ensure_guild(self, gid):
         # Discord serializes snowflakes as strings in Gateway/REST payloads,
         # while PostgreSQL BIGINT parameters require Python integers.
         gid = int(gid)
+        self._guild_cache.pop(gid, None)
+        if gid in self._known_guilds:
+            return
         await self.pool.execute("INSERT INTO guilds (id) VALUES ($1) ON CONFLICT DO NOTHING", gid)
+        self._known_guilds.add(gid)
 
     async def get_guild(self, gid):
         gid = int(gid)
-        await self.ensure_guild(gid)
-        return await self.pool.fetchrow("SELECT * FROM guilds WHERE id=$1", gid)
+        now = time.monotonic()
+        cached = self._guild_cache.get(gid)
+        if cached and (now - cached[0]) < 30.0:
+            return cached[1]
+        if gid not in self._known_guilds:
+            await self.pool.execute("INSERT INTO guilds (id) VALUES ($1) ON CONFLICT DO NOTHING", gid)
+            self._known_guilds.add(gid)
+        row = await self.pool.fetchrow("SELECT * FROM guilds WHERE id=$1", gid)
+        self._guild_cache[gid] = (now, row)
+        return row
 
     async def add_case(self, gid, uid, mod_id, action, reason=None, duration=None, expires_at=None):
         return await self.pool.fetchval(

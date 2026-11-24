@@ -1,13 +1,13 @@
 import asyncio, aiohttp, feedparser
 from interactions import subcommand, Interaction, STR, INT
 from database import db
-from helpers.permissions import can_manage_bot
+from helpers.permissions import can_manage_bot_async
 
 @subcommand("feed", "RSS feeds", "add", "Add an RSS feed", [
     {"name": "url", "description": "Feed URL", "type": STR, "required": True},
 ])
 async def add(i: Interaction, url):
-    if not can_manage_bot(i):
+    if not await can_manage_bot_async(i, db.pool):
         return await i.respond("❌ Only the server owner or an administrator can configure feeds.", ephemeral=True)
     fid = await db.pool.fetchval(
         "INSERT INTO feeds (guild_id,channel_id,url) VALUES ($1,$2,$3) RETURNING id",
@@ -18,7 +18,7 @@ async def add(i: Interaction, url):
     {"name": "id", "description": "Feed ID", "type": INT, "required": True},
 ])
 async def remove_feed(i: Interaction, id):
-    if not can_manage_bot(i):
+    if not await can_manage_bot_async(i, db.pool):
         return await i.respond("❌ Only the server owner or an administrator can configure feeds.", ephemeral=True)
     res = await db.pool.execute(
         "DELETE FROM feeds WHERE id=$1 AND guild_id=$2", int(id), int(i.guild_id)

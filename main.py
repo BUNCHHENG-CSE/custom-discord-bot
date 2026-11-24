@@ -8,7 +8,7 @@ from collections import OrderedDict
 from config import Config
 from rest import REST
 from gateway import Gateway
-from interactions import Interaction, all_specs, resolve_handler
+from interactions import Interaction, resolve_handler
 from database import db
 from lavalink import lavalink
 import modules  # noqa: F401 — importing registers slash commands
@@ -24,22 +24,47 @@ log = logging.getLogger("main")
 
 
 def acquire_instance_lock():
-    """Keep a second copy of this bot from stealing Discord voice sessions."""
+    """Keep a second copy of this bot from stealing Discord voice sessions.
+
+    Container-safe: clears leftover lockfiles on Pterodactyl/Wispbyte restarts,
+    marks the descriptor non-inheritable, and handles filesystems without flock.
+    """
+    import os
+    import errno
+
     lock_path = Path(__file__).with_name(".bot-instance.lock")
+    if os.getenv("DISABLE_INSTANCE_LOCK", "").lower() in ("true", "1", "yes"):
+        return None
+    if os.getenv("P_SERVER_UUID") or Path("/home/container").exists():
+        try:
+            lock_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+
     handle = lock_path.open("a+b")
+    try:
+        os.set_inheritable(handle.fileno(), False)
+    except OSError:
+        pass
     try:
         handle.seek(0, 2)
         if handle.tell() == 0:
-            handle.write(b"1")
+            handle.write(f"{os.getpid()}\n".encode())
             handle.flush()
         handle.seek(0)
-        if __import__("os").name == "nt":
+        if os.name == "nt":
             import msvcrt
             msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
         else:
             import fcntl
             fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except (OSError, BlockingIOError):
+            handle.seek(0)
+            handle.truncate()
+            handle.write(f"{os.getpid()}\n".encode())
+            handle.flush()
+    except (OSError, BlockingIOError) as exc:
+        if getattr(exc, "errno", None) in (errno.ENOSYS, errno.EOPNOTSUPP):
+            return handle
         handle.close()
         raise RuntimeError(
             "Another bot instance is already running from this directory."
@@ -125,26 +150,33 @@ async def _try_lavalink_voice(gid: int) -> None:
 # Audit cache & Idle voice helpers
 # ==================================================================
 _message_cache: OrderedDict[int, dict] = OrderedDict()
+_idle_disconnect_tasks: dict[int, asyncio.Task] = {}
 
 async def _auto_disconnect_if_empty(gid: int, channel_id: int):
-    await asyncio.sleep(60)
-    if gid in state.music_247_guilds:
-        return
-    bot_sess = state.bot_voice_sessions.get(gid)
-    if not bot_sess or int(bot_sess.get("channel_id") or 0) != channel_id:
-        return
-    vs = state.voice_states.get(gid, {})
-    human_listeners = [u for u, c in vs.items() if c == channel_id and str(u) != str(state.bot_user_id)]
-    if not human_listeners and gid in lavalink.players:
-        player = lavalink.players.get(gid)
-        if player and player.text_channel and player.rest:
-            try:
-                await player.rest.post(f"/channels/{player.text_channel}/messages",
-                                       json={"content": "👋 Disconnected from voice: channel remained empty for 60 seconds."})
-            except Exception:
-                pass
-        await lavalink.destroy(gid)
-        await state.gateway.send_voice_state(gid, None)
+    try:
+        await asyncio.sleep(60)
+        if gid in state.music_247_guilds:
+            return
+        bot_sess = state.bot_voice_sessions.get(gid)
+        if not bot_sess or int(bot_sess.get("channel_id") or 0) != channel_id:
+            return
+        vs = state.voice_states.get(gid, {})
+        human_listeners = [u for u, c in vs.items() if c == channel_id and str(u) != str(state.bot_user_id)]
+        if not human_listeners and gid in lavalink.players:
+            player = lavalink.players.get(gid)
+            if player and player.text_channel and player.rest:
+                try:
+                    await player.rest.post(f"/channels/{player.text_channel}/messages",
+                                           json={"content": "👋 Disconnected from voice: channel remained empty for 60 seconds."})
+                except Exception:
+                    pass
+            await lavalink.destroy(gid)
+            await state.gateway.send_voice_state(gid, None)
+    except asyncio.CancelledError:
+        pass
+    finally:
+        if _idle_disconnect_tasks.get(gid) is asyncio.current_task():
+            _idle_disconnect_tasks.pop(gid, None)
 
 
 # ==================================================================
@@ -199,6 +231,8 @@ async def on_dispatch(event: str, d: dict) -> None:
             guild_id = int(d["guild_id"])
             role_id = int(d["role_id"])
             cache.roles.pop((guild_id, role_id), None)
+            from helpers.permissions import remove_cached_staff_role
+            remove_cached_staff_role(guild_id, role_id)
             await db.pool.execute(
                 "DELETE FROM guild_staff_roles WHERE guild_id = $1 AND role_id = $2",
                 guild_id, role_id,
@@ -239,7 +273,7 @@ async def on_dispatch(event: str, d: dict) -> None:
                     "guild_id": int(d["guild_id"]),
                     "channel_id": int(d["channel_id"]),
                 }
-                if len(_message_cache) > 2000:
+                if len(_message_cache) > 1000:
                     _message_cache.popitem(last=False)
 
                 from modules.community import handle_afk_message, award_message_xp
@@ -251,9 +285,14 @@ async def on_dispatch(event: str, d: dict) -> None:
                 # MESSAGE_CREATE carries the sender's current roles. Cache them
                 # so prefix commands use the same permission checks as slash
                 # commands, then route any tct! command before automod.
-                cache.members[(int(d["guild_id"]), int(d["author"]["id"]))] = {
+                member_key = (int(d["guild_id"]), int(d["author"]["id"]))
+                existing_member = cache.members.get(member_key) or {}
+                member_payload = d.get("member") or {}
+                cache.members[member_key] = {
+                    **existing_member,
+                    **member_payload,
                     "user": d["author"],
-                    "roles": (d.get("member") or {}).get("roles", []),
+                    "roles": member_payload.get("roles", existing_member.get("roles", [])),
                 }
                 from prefix_commands import handle_prefix_message
                 handled = await handle_prefix_message(rest, d, cache)
@@ -267,12 +306,15 @@ async def on_dispatch(event: str, d: dict) -> None:
                 except Exception:
                     pass
 
+                from modules.moderation import automod_message, automod_would_trigger
+                content = d.get("content", "")
+                if not automod_would_trigger(content):
+                    return
                 from helpers.permissions import can_use_staff_commands
                 from interactions import MessageContext
                 ctx = MessageContext(rest, d, cache)
                 is_staff_user = await can_use_staff_commands(ctx, db.pool)
 
-                from modules.moderation import automod_message
                 await automod_message(
                     int(d["guild_id"]), int(d["channel_id"]),
                     int(d["author"]["id"]), rest,
@@ -390,8 +432,12 @@ async def on_dispatch(event: str, d: dict) -> None:
             if bot_sess and bot_sess.get("channel_id"):
                 b_cid = int(bot_sess["channel_id"])
                 humans = [u for u, ch_id in vs.items() if ch_id == b_cid and str(u) != str(state.bot_user_id)]
-                if not humans and gid in lavalink.players:
-                    asyncio.create_task(_auto_disconnect_if_empty(gid, b_cid))
+                if humans:
+                    old_task = _idle_disconnect_tasks.pop(gid, None)
+                    if old_task:
+                        old_task.cancel()
+                elif gid in lavalink.players and gid not in _idle_disconnect_tasks:
+                    _idle_disconnect_tasks[gid] = asyncio.create_task(_auto_disconnect_if_empty(gid, b_cid))
 
 
             if str(uid) == state.bot_user_id:
@@ -412,6 +458,11 @@ async def on_dispatch(event: str, d: dict) -> None:
                     # next join starts from a clean slate.
                     state.bot_voice_sessions.pop(gid, None)
                     state.pending_voice.pop(gid, None)
+                    old_task = _idle_disconnect_tasks.pop(gid, None)
+                    if old_task:
+                        old_task.cancel()
+                    if gid not in lavalink._rejoining and gid in lavalink.players:
+                        await lavalink.destroy(gid)
 
 
         elif event == "VOICE_SERVER_UPDATE":

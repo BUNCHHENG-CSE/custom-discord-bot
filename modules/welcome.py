@@ -5,7 +5,7 @@ import re
 from typing import Any
 
 from database import db
-from helpers.permissions import can_manage_bot
+from helpers.permissions import can_manage_bot_async
 from interactions import Interaction
 
 
@@ -74,6 +74,7 @@ async def _save_config(guild_id: int, kind: str, config: dict) -> None:
         json.dumps(config),
         int(guild_id),
     )
+    db.invalidate_guild(guild_id)
 
 
 def _parse_color(raw: str) -> int:
@@ -394,7 +395,7 @@ async def handle_member_remove(rest, member: dict, cache) -> None:
 
 
 async def handle_component(i: Interaction) -> None:
-    if not can_manage_bot(i):
+    if not await can_manage_bot_async(i, db.pool):
         return await i.respond("❌ Only administrators can configure greetings.", ephemeral=True)
 
     parts = (i.custom_id or "").split(":", 1)
@@ -429,6 +430,7 @@ async def handle_component(i: Interaction) -> None:
             f"UPDATE guilds SET {kind}_config = '{{}}'::jsonb WHERE id = $1",
             guild_id,
         )
+        db.invalidate_guild(guild_id)
         row = await db.get_guild(guild_id)
         channel_id = row[f"{kind}_channel"]
         if channel_id is not None:
@@ -447,6 +449,7 @@ async def handle_component(i: Interaction) -> None:
             f"UPDATE guilds SET {kind}_channel = 0 WHERE id = $1",
             guild_id,
         )
+        db.invalidate_guild(guild_id)
         row = await db.get_guild(guild_id)
         config = _parse_config(row[f"{kind}_config"]) if row else {}
         embed, components = _build_dashboard(kind, guild_id, 0, config, guild)
@@ -461,7 +464,7 @@ async def handle_component(i: Interaction) -> None:
 async def configure_greeting(ctx, kind: str, argument: str) -> None:
     if not ctx.guild_id:
         return await ctx.respond("❌ This command can only be used in a server.")
-    if not can_manage_bot(ctx):
+    if not await can_manage_bot_async(ctx, db.pool):
         return await ctx.respond("❌ Only the server owner or an administrator can configure greetings.")
 
     guild_id = int(ctx.guild_id)
@@ -497,12 +500,14 @@ async def configure_greeting(ctx, kind: str, argument: str) -> None:
     if arg.lower() in ("off", "disable", "stop"):
         await db.ensure_guild(guild_id)
         await db.pool.execute(f"UPDATE guilds SET {channel_col}=0 WHERE id=$1", guild_id)
+        db.invalidate_guild(guild_id)
         return await ctx.respond(f"✅ {kind.title()} messages disabled.")
 
     # 4. Reset design
     if arg.lower() in ("reset", "default"):
         await db.ensure_guild(guild_id)
         await db.pool.execute(f"UPDATE guilds SET {kind}_config='{{}}'::jsonb WHERE id=$1", guild_id)
+        db.invalidate_guild(guild_id)
         return await ctx.respond(f"✅ {kind.title()} design reset to default.")
 
     parts = arg.split(maxsplit=1)
@@ -533,11 +538,11 @@ async def configure_greeting(ctx, kind: str, argument: str) -> None:
         if subarg.lower() in ("none", "off", "disable", "remove"):
             config["title"] = ""
             await _save_config(guild_id, kind, config)
-            return await ctx.respond(f"✅ Embed title removed.")
+            return await ctx.respond("✅ Embed title removed.")
         elif subarg.lower() == "default":
             config.pop("title", None)
             await _save_config(guild_id, kind, config)
-            return await ctx.respond(f"✅ Embed title reset to default.")
+            return await ctx.respond("✅ Embed title reset to default.")
         else:
             config["title"] = subarg
             await _save_config(guild_id, kind, config)
@@ -554,7 +559,7 @@ async def configure_greeting(ctx, kind: str, argument: str) -> None:
         if subarg.lower() == "default":
             config.pop("color", None)
             await _save_config(guild_id, kind, config)
-            return await ctx.respond(f"✅ Embed color reset to default.")
+            return await ctx.respond("✅ Embed color reset to default.")
         try:
             color_int = _parse_color(subarg)
             config["color"] = color_int
@@ -573,11 +578,11 @@ async def configure_greeting(ctx, kind: str, argument: str) -> None:
         if subarg.lower() in ("none", "off", "remove"):
             config["footer"] = ""
             await _save_config(guild_id, kind, config)
-            return await ctx.respond(f"✅ Embed footer removed.")
+            return await ctx.respond("✅ Embed footer removed.")
         elif subarg.lower() == "default":
             config.pop("footer", None)
             await _save_config(guild_id, kind, config)
-            return await ctx.respond(f"✅ Embed footer reset to default.")
+            return await ctx.respond("✅ Embed footer reset to default.")
         else:
             config["footer"] = subarg
             await _save_config(guild_id, kind, config)
@@ -589,11 +594,11 @@ async def configure_greeting(ctx, kind: str, argument: str) -> None:
         if subarg.lower() in ("on", "true", "enable", "yes"):
             config["thumbnail"] = True
             await _save_config(guild_id, kind, config)
-            return await ctx.respond(f"✅ Avatar thumbnail enabled.")
+            return await ctx.respond("✅ Avatar thumbnail enabled.")
         elif subarg.lower() in ("off", "false", "disable", "no"):
             config["thumbnail"] = False
             await _save_config(guild_id, kind, config)
-            return await ctx.respond(f"✅ Avatar thumbnail disabled.")
+            return await ctx.respond("✅ Avatar thumbnail disabled.")
         else:
             return await ctx.respond(f"❌ Usage: `tct!{kind} thumbnail on` or `off`.")
 
@@ -602,11 +607,11 @@ async def configure_greeting(ctx, kind: str, argument: str) -> None:
         if subarg.lower() in ("on", "true", "enable", "yes"):
             config["fields"] = True
             await _save_config(guild_id, kind, config)
-            return await ctx.respond(f"✅ Member stats fields enabled.")
+            return await ctx.respond("✅ Member stats fields enabled.")
         elif subarg.lower() in ("off", "false", "disable", "no"):
             config["fields"] = False
             await _save_config(guild_id, kind, config)
-            return await ctx.respond(f"✅ Member stats fields disabled.")
+            return await ctx.respond("✅ Member stats fields disabled.")
         else:
             return await ctx.respond(f"❌ Usage: `tct!{kind} fields on` or `off`.")
 
@@ -615,11 +620,11 @@ async def configure_greeting(ctx, kind: str, argument: str) -> None:
         if subarg.lower() in ("on", "true", "enable", "yes"):
             config["ping"] = True
             await _save_config(guild_id, kind, config)
-            return await ctx.respond(f"✅ User mention ping enabled (member will be notified).")
+            return await ctx.respond("✅ User mention ping enabled (member will be notified).")
         elif subarg.lower() in ("off", "false", "disable", "no"):
             config["ping"] = False
             await _save_config(guild_id, kind, config)
-            return await ctx.respond(f"✅ User mention ping disabled (embed only).")
+            return await ctx.respond("✅ User mention ping disabled (embed only).")
         else:
             return await ctx.respond(f"❌ Usage: `tct!{kind} ping on` or `off`.")
 
@@ -628,9 +633,9 @@ async def configure_greeting(ctx, kind: str, argument: str) -> None:
         if not subarg or subarg.lower() in ("none", "off", "remove"):
             config.pop("image", None)
             await _save_config(guild_id, kind, config)
-            return await ctx.respond(f"✅ Banner image removed.")
+            return await ctx.respond("✅ Banner image removed.")
         if not _is_valid_url(subarg):
-            return await ctx.respond(f"❌ Please provide a valid `http://` or `https://` image URL.")
+            return await ctx.respond("❌ Please provide a valid `http://` or `https://` image URL.")
         config["image"] = subarg
         await _save_config(guild_id, kind, config)
         return await ctx.respond(f"✅ **Banner image set!**\n<{subarg}>")
@@ -650,6 +655,7 @@ async def configure_greeting(ctx, kind: str, argument: str) -> None:
         await db.pool.execute(
             f"UPDATE guilds SET {channel_col}=$1 WHERE id=$2", int(channel), guild_id
         )
+        db.invalidate_guild(guild_id)
         return await ctx.respond(f"✅ {kind.title()} messages will be sent in <#{channel}>.")
 
     # Unknown option

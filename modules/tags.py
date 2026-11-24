@@ -2,7 +2,7 @@
 
 from database import db
 from helpers.permissions import can_use_staff_commands
-from interactions import Interaction, STR, slash, subcommand
+from interactions import Interaction, STR, subcommand
 
 
 @subcommand("tag", "Custom tag system", "get", "Display a saved tag", [

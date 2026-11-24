@@ -5,3 +5,6 @@ redis>=5.0
 python-dotenv>=1.0
 feedparser>=6.0
 openai>=1.30
+cryptography>=42.0
+qrcode>=7.4
+pillow>=10.0

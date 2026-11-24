@@ -9,6 +9,9 @@ from websockets.client import WebSocketClientProtocol
 
 log = logging.getLogger("gateway")
 
+# Strong references so in-flight dispatch tasks are not garbage-collected
+_dispatch_tasks: set[asyncio.Task] = set()
+
 GATEWAY_URL = "wss://gateway.discord.gg/?v=10&encoding=json"
 
 # All standard Discord Gateway intents (including privileged intents enabled in developer portal)
@@ -63,6 +66,8 @@ class Gateway:
                 break
             except Exception as e:
                 log.warning("Gateway error: %s — reconnecting in 5s", e)
+                if not self.session_id:
+                    self.resume_gateway_url = None
                 await asyncio.sleep(5)
 
     async def _connect(self) -> None:
@@ -144,13 +149,18 @@ class Gateway:
                 if evt == "READY":
                     data = msg["d"]
                     self.session_id = data["session_id"]
-                    self.resume_gateway_url = f"{data.get('resume_gateway_url', GATEWAY_URL)}?v=10&encoding=json"
+                    resume_url = (data.get("resume_gateway_url") or "").rstrip("/")
+                    self.resume_gateway_url = (
+                        f"{resume_url}/?v=10&encoding=json" if resume_url else GATEWAY_URL
+                    )
                     username = data.get("user", {}).get("username", "Unknown")
                     log.info("Ready as %s (session_id: %s)", username, self.session_id)
                 elif evt == "RESUMED":
                     log.info("Session resumed successfully.")
 
-                asyncio.create_task(self.on_dispatch(evt, msg.get("d", {})))
+                t = asyncio.create_task(self.on_dispatch(evt, msg.get("d", {})))
+                _dispatch_tasks.add(t)
+                t.add_done_callback(_dispatch_tasks.discard)
 
             elif op == 1:  # Heartbeat request from Discord
                 await self._send({"op": 1, "d": self.seq})

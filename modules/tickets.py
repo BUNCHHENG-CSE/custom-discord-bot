@@ -1,7 +1,8 @@
-import asyncio, io, json, aiohttp
-from interactions import slash, subcommand, Interaction, STR, USER
+import asyncio, json, aiohttp
+from interactions import subcommand, Interaction, STR, USER
 from database import db
-from helpers.permissions import can_manage_bot, can_use_staff_commands
+from helpers.permissions import can_manage_bot_async, can_use_staff_commands
+import state
 
 # Components: type 1=ActionRow, 2=Button, 3=StringSelect
 def _panel_components(panel):
@@ -32,7 +33,7 @@ def _ticket_controls(claimed_by_name: str | None = None):
     {"name": "panel", "description": "Panel id", "type": STR, "required": False},
 ])
 async def panel(i: Interaction, panel="default"):
-    if not can_manage_bot(i):
+    if not await can_manage_bot_async(i, db.pool):
         return await i.respond("❌ Only the server owner or an administrator can post a panel.", ephemeral=True)
     embed = {"title": "Support Tickets", "description": "Click below to open a ticket.",
              "color": 0x5865F2}
@@ -171,14 +172,45 @@ async def handle_component(i: Interaction):
             "SELECT * FROM tickets WHERE guild_id=$1 AND user_id=$2 AND status='open'",
             i.guild_id, i.user_id)
         if existing:
-            return await i.respond(f"You already have a ticket: <#{existing['channel_id']}>",
-                                    ephemeral=True)
-        # create channel
-        body = {"name": f"ticket-{i.user['username'][:20]}", "type": 0,
-                "permission_overwrites": [
-                    {"id": str(i.guild_id), "type": 0, "deny": str(1<<10), "allow": "0"},
-                    {"id": str(i.user_id), "type": 1, "allow": str((1<<10)|(1<<11)|(1<<16)), "deny": "0"},
-                ]}
+            try:
+                await i.rest.get(f"/channels/{existing['channel_id']}")
+                return await i.respond(f"You already have a ticket: <#{existing['channel_id']}>",
+                                       ephemeral=True)
+            except Exception:
+                await db.pool.execute(
+                    "UPDATE tickets SET status='closed', closed_at=NOW() WHERE id=$1",
+                    existing["id"],
+                )
+        overwrites = [
+            {"id": str(i.guild_id), "type": 0, "deny": str(1 << 10), "allow": "0"},
+            {"id": str(i.user_id), "type": 1, "allow": str((1 << 10) | (1 << 11) | (1 << 16)), "deny": "0"},
+        ]
+        if state.bot_user_id:
+            overwrites.append({
+                "id": str(state.bot_user_id),
+                "type": 1,
+                "allow": str((1 << 10) | (1 << 11) | (1 << 16) | (1 << 4)),
+                "deny": "0",
+            })
+        try:
+            staff_rows = await db.pool.fetch(
+                "SELECT role_id FROM guild_staff_roles WHERE guild_id=$1 AND is_staff=TRUE",
+                int(i.guild_id),
+            )
+            for sr in staff_rows:
+                overwrites.append({
+                    "id": str(sr["role_id"]),
+                    "type": 0,
+                    "allow": str((1 << 10) | (1 << 11) | (1 << 16)),
+                    "deny": "0",
+                })
+        except Exception:
+            pass
+        body = {
+            "name": f"ticket-{i.user.get('username', 'user')[:20]}",
+            "type": 0,
+            "permission_overwrites": overwrites,
+        }
         ch = await i.rest.post(f"/guilds/{i.guild_id}/channels", json=body)
         await db.pool.execute(
             "INSERT INTO tickets (guild_id,channel_id,user_id,panel) VALUES ($1,$2,$3,$4)",

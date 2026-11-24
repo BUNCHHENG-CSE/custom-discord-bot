@@ -14,9 +14,14 @@ import re
 from typing import Any
 
 import aiohttp
-import qrcode
-from cryptography.hazmat.primitives import serialization
-from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey
+try:
+    import qrcode
+    from cryptography.hazmat.primitives import serialization
+    from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey
+except ImportError:
+    qrcode = None  # type: ignore
+    serialization = None  # type: ignore
+    X25519PrivateKey = None  # type: ignore
 
 from config import Config
 from interactions import Interaction, STR, subcommand
@@ -175,7 +180,7 @@ async def vpn_regions(i: Interaction):
 async def vpn_create(i: Interaction, region: str, device: str = "TCT-Device"):
     await i.defer(ephemeral=True)
     try:
-        clean_dev = device.strip()[:32] or "TCT-Device"
+        clean_dev = (device or "TCT-Device").strip()[:32] or "TCT-Device"
         priv_key, pub_key = generate_wireguard_keypair()
 
         discord_username = str(i.user.get("username") or f"discord_{i.user_id}")
@@ -208,17 +213,18 @@ async def vpn_create(i: Interaction, region: str, device: str = "TCT-Device"):
 
         qr_bytes = render_qr_png(conf_text)
         safe_slug = re.sub(r"[^a-zA-Z0-9_-]+", "-", clean_dev.lower()).strip("-") or "device"
+        clean_ip = str(peer["assignedIp"]).split("/")[0]
 
         embed = {
             "title": "✅ WireGuard Tunnel Provisioned",
             "description": (
-                f"Your zero-knowledge encrypted tunnel is online and ready to connect.\n"
-                f"Import the attached **`.conf`** file or scan the **QR code** on mobile."
+                "Your zero-knowledge encrypted tunnel is online and ready to connect.\n"
+                "Import the attached **`.conf`** file or scan the **QR code** on mobile."
             ),
             "color": 0x10B981,
             "fields": [
                 {"name": "Device Name", "value": f"`{peer['deviceName']}`", "inline": True},
-                {"name": "Tunnel IP", "value": f"`{peer['assignedIp']}/32`", "inline": True},
+                {"name": "Tunnel IP", "value": f"`{clean_ip}/32`", "inline": True},
                 {"name": "Gateway", "value": f"{node.get('flagEmoji', '🌐')} {node['name']}", "inline": True},
                 {"name": "Endpoint", "value": f"`{node['publicIp']}:{node['endpointPort']}`", "inline": True},
                 {"name": "DNS", "value": f"`{node['dnsServers']}`", "inline": True},
@@ -233,6 +239,23 @@ async def vpn_create(i: Interaction, region: str, device: str = "TCT-Device"):
             (f"tct-{safe_slug}.conf", conf_text.encode("utf-8"), "text/plain"),
             (f"tct-{safe_slug}-qr.png", qr_bytes, "image/png"),
         ]
+
+        # Protect private keys when invoked via prefix command in a public guild channel
+        if not i.token and i.guild_id:
+            try:
+                import json
+                dm = await i.rest.post("/users/@me/channels", json={"recipient_id": str(i.user_id)})
+                form = aiohttp.FormData()
+                form.add_field("payload_json", json.dumps({"embeds": [embed]}), content_type="application/json")
+                for idx, (fname, fbytes, ctype) in enumerate(files):
+                    form.add_field(f"files[{idx}]", fbytes, filename=fname, content_type=ctype)
+                await i.rest.post(f"/channels/{dm['id']}/messages", data=form)
+                return await i.followup("🔒 Your WireGuard VPN profile and QR code have been sent to your **DMs**!")
+            except Exception:
+                return await i.followup(
+                    "⚠️ Your tunnel was created, but I couldn't DM your private `.conf` file. "
+                    "Please enable DMs from server members or run `tct!vpncreate` in a private DM with me."
+                )
 
         await i.followup(embeds=[embed], files=files, ephemeral=True)
     except Exception as exc:

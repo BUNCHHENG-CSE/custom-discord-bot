@@ -7,12 +7,44 @@ import time
 from datetime import datetime, timezone
 
 from database import db
-from helpers.permissions import can_manage_bot, can_use_staff_commands
+from helpers.permissions import can_manage_bot_async, can_use_staff_commands
 from interactions import slash, Interaction, USER, STR, INT, ROLE, CHANNEL
 from modules.moderation import parse_duration
 
 # Cooldown tracker for XP gain: (guild_id, user_id) -> last_awarded_epoch
 _xp_cooldowns: dict[tuple[int, int], float] = {}
+# Message counts accumulated while a user is on XP cooldown, flushed in batches
+# so ordinary chatter doesn't cost one DB round-trip per message.
+_pending_msgs: dict[tuple[int, int], int] = {}
+_flush_task: asyncio.Task | None = None
+_FLUSH_INTERVAL = 30.0
+
+
+async def _flush_pending_msgs() -> None:
+    if not _pending_msgs:
+        return
+    batch = [(g, u, n) for (g, u), n in _pending_msgs.items()]
+    _pending_msgs.clear()
+    await db.pool.executemany(
+        """INSERT INTO user_levels (guild_id, user_id, xp, level, messages)
+           VALUES ($1, $2, 0, 0, $3)
+           ON CONFLICT (guild_id, user_id)
+           DO UPDATE SET messages = user_levels.messages + EXCLUDED.messages""",
+        batch,
+    )
+
+
+async def _flush_loop() -> None:
+    while True:
+        await asyncio.sleep(_FLUSH_INTERVAL)
+        try:
+            await _flush_pending_msgs()
+        except Exception:
+            pass
+        # Drop expired cooldown entries so the dict doesn't grow forever
+        cutoff = time.time() - 60.0
+        for k in [k for k, t in _xp_cooldowns.items() if t < cutoff]:
+            _xp_cooldowns.pop(k, None)
 # Suggestion vote tracker: message_id -> {"up": set[int], "down": set[int]}
 _suggestion_votes: dict[int, dict[str, set[int]]] = {}
 
@@ -34,34 +66,31 @@ async def award_message_xp(rest, guild_id: int, channel_id: int, user_id: int) -
     if db.redis:
         try:
             rkey = f"xp_cd:{guild_id}:{user_id}"
-            if await db.redis.get(rkey):
-                on_cooldown = True
-            else:
-                await db.redis.set(rkey, "1", ex=60)
+            # Atomic check-and-set: one round-trip instead of GET + SET
+            on_cooldown = not await db.redis.set(rkey, "1", ex=60, nx=True)
         except Exception:
             on_cooldown = (now - _xp_cooldowns.get(key, 0.0)) < 60.0
     else:
         on_cooldown = (now - _xp_cooldowns.get(key, 0.0)) < 60.0
 
+    global _flush_task
+    if _flush_task is None or _flush_task.done():
+        _flush_task = asyncio.create_task(_flush_loop(), name="xp-flush")
+
     if on_cooldown:
-        await db.pool.execute(
-            """INSERT INTO user_levels (guild_id, user_id, xp, level, messages)
-               VALUES ($1, $2, 0, 0, 1)
-               ON CONFLICT (guild_id, user_id)
-               DO UPDATE SET messages = user_levels.messages + 1""",
-            guild_id, user_id,
-        )
+        _pending_msgs[key] = _pending_msgs.get(key, 0) + 1
         return
 
     _xp_cooldowns[key] = now
     gained = random.randint(15, 25)
+    msgs = 1 + _pending_msgs.pop(key, 0)
     row = await db.pool.fetchrow(
         """INSERT INTO user_levels (guild_id, user_id, xp, level, messages)
-           VALUES ($1, $2, $3, 0, 1)
+           VALUES ($1, $2, $3, 0, $4)
            ON CONFLICT (guild_id, user_id)
-           DO UPDATE SET xp = user_levels.xp + $3, messages = user_levels.messages + 1
+           DO UPDATE SET xp = user_levels.xp + $3, messages = user_levels.messages + $4
            RETURNING xp, level""",
-        guild_id, user_id, gained,
+        guild_id, user_id, gained, msgs,
     )
     if not row:
         return
@@ -165,7 +194,7 @@ async def leaderboard_cmd(i: Interaction):
     {"name": "role", "description": "Role to grant", "type": ROLE, "required": True},
 ])
 async def levelreward_cmd(i: Interaction, level: int, role):
-    if not can_manage_bot(i):
+    if not await can_manage_bot_async(i, db.pool):
         return await i.respond("❌ Only the server owner or an administrator can configure level rewards.", ephemeral=True)
     lvl = int(level)
     rid = int(str(role).strip().strip("<@&>"))
@@ -181,20 +210,34 @@ async def levelreward_cmd(i: Interaction, level: int, role):
 
 
 # =====================================================================
-# 2. AFK System
+# 2. AFK System (with in-memory index to avoid DB hits on normal messages)
 # =====================================================================
+_afk_cache: set[tuple[int, int]] | None = None
+
+
+async def _ensure_afk_cache() -> set[tuple[int, int]]:
+    global _afk_cache
+    if _afk_cache is None:
+        rows = await db.pool.fetch("SELECT guild_id, user_id FROM afk_users")
+        _afk_cache = {(int(r["guild_id"]), int(r["user_id"])) for r in rows}
+    return _afk_cache
+
+
 @slash("afk", "Set your AFK status", [
     {"name": "reason", "description": "AFK reason", "type": STR, "required": False},
 ])
 async def afk_cmd(i: Interaction, reason: str = "AFK"):
     clean_reason = (reason or "AFK").strip()[:200]
+    gid, uid = int(i.guild_id), int(i.user_id)
     await db.pool.execute(
         """INSERT INTO afk_users (guild_id, user_id, reason, created_at)
            VALUES ($1, $2, $3, NOW())
            ON CONFLICT (guild_id, user_id)
            DO UPDATE SET reason = EXCLUDED.reason, created_at = NOW()""",
-        int(i.guild_id), int(i.user_id), clean_reason,
+        gid, uid, clean_reason,
     )
+    afk_set = await _ensure_afk_cache()
+    afk_set.add((gid, uid))
     await i.respond(f"💤 <@{i.user_id}> is now AFK: **{clean_reason}**")
 
 
@@ -203,9 +246,11 @@ async def handle_afk_message(rest, d: dict) -> None:
     channel_id = int(d["channel_id"])
     author_id = int(d["author"]["id"])
     content = (d.get("content") or "").strip()
+    afk_set = await _ensure_afk_cache()
 
     # If the author was AFK (and isn't just invoking tct!afk), clear their AFK status
-    if not content.lower().startswith("tct!afk"):
+    if (guild_id, author_id) in afk_set and not content.lower().startswith("tct!afk"):
+        afk_set.discard((guild_id, author_id))
         removed = await db.pool.fetchrow(
             "DELETE FROM afk_users WHERE guild_id=$1 AND user_id=$2 RETURNING created_at",
             guild_id, author_id,
@@ -220,7 +265,12 @@ async def handle_afk_message(rest, d: dict) -> None:
                 pass
 
     # Notify if any mentioned users are AFK
-    mentioned_ids = {int(m) for m in re.findall(r"<@!?(\d+)>", content)} - {author_id}
+    if "<@" not in content:
+        return
+    mentioned_ids = {
+        int(m) for m in re.findall(r"<@!?(\d+)>", content)
+        if (guild_id, int(m)) in afk_set
+    } - {author_id}
     if not mentioned_ids:
         return
     rows = await db.pool.fetch(
@@ -300,11 +350,12 @@ def _suggest_components(up_count: int = 0, down_count: int = 0, closed: bool = F
     {"name": "channel", "description": "Suggestions channel", "type": CHANNEL, "required": True},
 ])
 async def setsuggest_cmd(i: Interaction, channel):
-    if not can_manage_bot(i):
+    if not await can_manage_bot_async(i, db.pool):
         return await i.respond("❌ Only the server owner or an administrator can configure suggestions.", ephemeral=True)
     cid = int(str(channel).strip().strip("<#>"))
     await db.ensure_guild(i.guild_id)
     await db.pool.execute("UPDATE guilds SET suggest_channel=$1 WHERE id=$2", cid, int(i.guild_id))
+    db.invalidate_guild(i.guild_id)
     await i.respond(f"✅ Suggestions channel set to <#{cid}>.")
 
 
@@ -381,7 +432,7 @@ async def handle_component(i: Interaction) -> None:
     {"name": "threshold", "description": "Minimum ⭐ reactions (default: 3)", "type": INT, "required": False},
 ])
 async def setstarboard_cmd(i: Interaction, channel, threshold: int = 3):
-    if not can_manage_bot(i):
+    if not await can_manage_bot_async(i, db.pool):
         return await i.respond("❌ Only the server owner or an administrator can configure the starboard.", ephemeral=True)
     cid = int(str(channel).strip().strip("<#>"))
     thresh = max(1, min(int(threshold or 3), 100))
@@ -390,6 +441,7 @@ async def setstarboard_cmd(i: Interaction, channel, threshold: int = 3):
         "UPDATE guilds SET starboard_channel=$1, starboard_threshold=$2 WHERE id=$3",
         cid, thresh, int(i.guild_id),
     )
+    db.invalidate_guild(i.guild_id)
     await i.respond(f"⭐ Starboard set to <#{cid}> (threshold: **{thresh}** ⭐).")
 
 

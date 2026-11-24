@@ -19,4 +19,4 @@ snipe_cache: dict[int, dict] = {}
 editsnipe_cache: dict[int, dict] = {}
 
 # guild_ids with 24/7 voice mode enabled
-music_247_guilds: set[int] = set()
+music_247_guilds: set[int] = set()
